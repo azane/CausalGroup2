@@ -62,6 +62,9 @@ sum(is.na(datBos$vehicle_type))
 # Positivity assumptions maybe violated (to be check)
 
 # G-computation
+# (1) NPMLE
+# (2) logistic model : E(Y|D, W) ~ all Ws
+# (3) may inlcude some interaction.
 datBos.searched <-  datBos %>% filter(search_conducted == TRUE)
 fit.gcomp <- glm(contraband_found ~ 
                    subject_age + 
