@@ -1,0 +1,444 @@
+---
+title: "Prevalence of Having Contraband among Pulled-over Drives"
+author: "Yukun Li"
+date: "12/4/2019"
+output: pdf_document
+---
+
+# Background and Introduction
+To be done.
+
+# Causal Roadma
+
+## Scientific Question:
+What is the prevalence of having contraband if all drives are searched.
+
+## Causal Model
+$W_1$ : age
+
+$W_2$ : race: black or not
+
+$W_3$ : gender : female or male
+
+$W_4$ : Speed or not
+
+$W = (W_1, W_2, W_3, W_4)$
+
+$\Delta$ : if search is conducted
+
+Y* : Underlying contraband status
+
+Y : if contraband is found
+
+- Endogenous variables: $X = (W_1, W_2, W_3, W_4, \Delta, Y)$
+
+- Exogenous variables: $U \sim \mathbb{P}_U$ (to be determined). 
+
+Structral equation $F$:
+
+\begin{align*}
+W_1 &= f_{W1}(U_{W1})\\
+W_2 &= f_{W2}(U_{W2})\\
+W_3 &= f_{W3}(U_{W3})\\
+W_4 &= f_{W4}(W_1, W_2, W_3, U_{W4})\\
+\Delta &= f_\Delta(W_1, W_2, W_3, W_4, U_\Delta)\\
+Y^* &= f_{Y^*}(W_1, W_2, W_3, W_4, U_{Y^*})\\
+Y &= \Delta \times Y^*
+\end{align*}
+
+## Causal Parameter
+$\Psi^*(\mathbb{P}^*) = \mathbb{P}^*(Y^* = 1) = \mathbb{P}^*(Y_{\Delta=1})$
+
+## Observed data and its link to causal model
+Observed data are randomly generated from the structual causal model.
+
+## Identifiability
+Lest's assume all $U$s are independent.
+
+## Statistical estimand
+$\Psi^*(\mathbb{P}^*)  = \Psi(\mathbb{P}_0) = \mathbb{E}_W\{\mathbb{P}_0(Y=1|\Delta=1,W)\}$
+
+## Estimate
+Parametric G-computation (simple substitution estimator), IPTW, TMLE. Use super learner during the estimating procedure. Don't forget to talk about the positivity assuptions.
+
+Present a detailed plan for statistical inference/variance estimation based on the non-parametric bootstrap and implement it.
+
+# Data preprocessing
+```{r, message=FALSE, cache = TRUE}
+# packages
+library(tidyverse)
+library(lubridate)
+library(SuperLearner)
+library(boot)
+library(ltmle)
+```
+
+```{r, cache = TRUE}
+# load dataset
+dat <- readRDS("data/MAStatePatrol.rds")
+# take a look at the variables we have
+colnames(dat)
+table(year(dat$date)) # the dataset is balanced over years
+
+dat_prep <- function(dat, loc, years){
+  
+  datBos <-  dat %>% 
+  filter(location == loc) %>% # select location
+  filter(year(date) == years) %>%  # select year
+  filter(vehicle_type == 'Passenger') %>% # passenegr vehicle only
+  # delete missing values
+  filter(!is.na(subject_age) & !is.na(subject_sex) & 
+           !is.na(subject_race) & !is.na(reason_for_stop) &
+           !is.na(search_conducted))  %>%
+  mutate(subject_race = as.character(subject_race)) %>% # change subject_race to string
+  # select following variables
+  select(subject_age,
+         subject_race,
+         subject_sex,
+         reason_for_stop,
+         contraband_found,
+         search_conducted)
+
+# drop unused levels from the dataframe
+datBos <- droplevels(datBos)
+# subject_race represents black or not
+datBos$subject_race[datBos$subject_race != 'black'] = 'others'
+# reason_for_stop represents speed or not
+datBos$reason_for_stop[datBos$reason_for_stop == 'Speed' & 
+                       datBos$reason_for_stop == 'Speed,SearBelt' &
+                       datBos$reason_for_stop == 'Speed,ChildRest' & 
+                       datBos$reason_for_stop == 'Speed,SeatBelt,ChildRest'] = 'Speed'
+datBos$reason_for_stop[datBos$reason_for_stop != 'Speed'] = 'Not Speed'
+return(datBos)
+}
+
+for (i in 2007:2015){
+  datBos <- dat_prep(dat, 'BOSTON', i)
+  print(table(datBos$contraband_found, useNA = 'ifany'))
+}
+
+datBos <- dat_prep(dat, 'BOSTON', 2007)
+
+# show summary and check postivity assumptions
+summary(datBos$search_conducted)
+summary(datBos$contraband_found)
+summary(datBos$subject_age)
+summary(datBos$subject_sex)
+table(datBos$subject_race)
+table(datBos$reason_for_stop)
+
+# check positivity assumption
+table(datBos$subject_race, datBos$subject_sex, datBos$reason_for_stop, datBos$search_conducted)
+```
+
+
+Following are some attemps of estiamtion, I'll consider more parametric models and super learner and put all of them in R functions.
+
+# G-computation
+
+\begin{equation*}
+\hat{\Psi}_{S S}(\hat{\mathbb{P}})=\frac{1}{n} \sum_{i=1}^{n}\left(\hat{\mathbb{E}}\left(Y | A_{i}=1, W_{i}\right)-\hat{\mathbb{E}}\left(Y | \Delta_{i}=0, W_{i}\right)\right)
+\end{equation*}
+
+We consider following parametric models of $\mathbb{E}(Y|\Delta, W)$:
+
+\begin{align*}
+\mathbb{E}(Y|\Delta, W) &= logit^{-1}(\beta_0 + \beta_1W_1 + \beta_2W_2 + 
+\beta_3W_3 + \beta_4W_4 + \beta_5\Delta)\\
+\mathbb{E}(Y|\Delta, W) &= logit^{-1}(\beta_0 + \beta_1W_1 + \beta_2W_2 + 
+\beta_3W_3 + \beta_4W_4 + \beta_5\Delta + \beta_6W1*W4 + \beta_6W2*W4 +
+\beta_6W3*W4)
+\end{align*}
+
+
+```{r, cache = TRUE}
+# G-computation 
+# reference: RCT_MissingData.pdf
+
+# only drives are searched
+datBos.searched <-  datBos %>% filter(search_conducted == TRUE)
+datBos.intervene <- datBos %>% mutate(search_conducted = TRUE)
+# 10 fold cross validation/Discrete super learner
+set.seed(2019)
+cv.error.1 <- cv.error.2 <- 0
+for (i in 1:10){
+  # model 1
+  fit.g1 <- glm(contraband_found ~ 
+                   subject_age + 
+                   subject_race + 
+                   subject_sex + 
+                   reason_for_stop,
+                 family = 'binomial', data = datBos.searched)
+  cv.error.1[i] <- cv.glm(datBos.searched, fit.g1, K = 10)$delta[1]
+  # model 2
+  fit.g2 <- glm(contraband_found ~ 
+                   subject_age*reason_for_stop + 
+                   subject_race*reason_for_stop + 
+                   subject_sex*reason_for_stop,
+                 family = 'binomial', data = datBos.searched)
+  cv.error.2[i] <- cv.glm(datBos.searched, fit.g2, K = 10)$delta[1]
+}
+c(mean(cv.error.1), mean(cv.error.2)) # model 1 is better
+
+# model 1 function
+gcomp.1 <- function(dat.s, dat.i){
+  fit.gcomp.1 <- glm(contraband_found ~ 
+                   subject_age + 
+                   subject_race + 
+                   subject_sex + 
+                   reason_for_stop,
+                 family = 'binomial', data = dat.s)
+  EY.gcomp.1 <- predict(fit.gcomp.1, newdata = dat.i, type = 'response')
+  est.gcomp.1 <- mean(EY.gcomp.1)
+  est.gcomp.1
+}
+dat.intervene <- datBos %>% mutate(search_conducted = TRUE)
+est.gcomp <- gcomp.1(datBos.searched, dat.intervene) # point estimate
+est.gcomp
+
+# Nonparametric bootstrap 500 times
+n <- nrow(datBos)
+est.g1 <- 0
+for (k in 1:500){
+  dat.bp <- datBos[sample(1:n, n, replace = TRUE), ]
+  dat.s<-  dat.bp %>% filter(search_conducted == TRUE)
+  dat.i <- dat.bp %>% mutate(search_conducted = TRUE)
+  est.g1[k] <- gcomp.1(dat.s, dat.i)
+}
+# mean
+mean(est.g1)
+# standard error
+sd(est.g1)
+# confidence interval 5%
+c(est.gcomp - 1.96*sd(est.g1), est.gcomp + 1.96*sd(est.g1))
+```
+
+# IPTW
+
+\begin{equation*}
+\hat{\Psi}_{I P T W}(\hat{\mathbb{P}})=\frac{1}{n} \sum_{i=1}^{n}\left(\frac{\mathbb{I}\left(\Delta_{i}=1\right)}{\hat{\mathbb{P}}\left(\Delta=1 | W_{i}\right)}-\frac{\mathbb{I}\left(\Delta_{i}=0\right)}{\hat{\mathbb{P}}\left(\Delta=0 | W_{i}\right)}\right) Y_{i}
+\end{equation*}
+
+Parametric models of $\mathbb{P}(A|W)$:
+
+\begin{align*}
+\mathbb{P}(\Delta|W) &= logit^{-1}(\beta_0 + \beta_1W_1 + \beta_2W_2 + 
+\beta_3W_3 + \beta_4W_4)\\
+\mathbb{E}(\Delta|W) &= logit^{-1}(\beta_0 + \beta_1W_1 + \beta_2W_2 + 
+\beta_3W_3 + \beta_4W_4 + \beta_6W1*W4 + \beta_6W2*W4 +
+\beta_6W3*W4)
+\end{align*}
+
+```{r, cache = TRUE}
+# IPTW # reference : RLab3.pdf
+
+# 10 fold cross validation/Discrete super learner
+set.seed(2019)
+cv.error.1 <- cv.error.2 <- 0
+for (i in 1:10){
+  # model 1
+  fit.prob.D.1 <- glm(search_conducted ~ 
+                    subject_age + 
+                    subject_race + 
+                    subject_sex + 
+                    reason_for_stop,
+                  family = 'binomial', data = datBos)
+  cv.error.1[i] <- cv.glm(datBos, fit.prob.D.1, K = 10)$delta[1]
+  # model 2
+  fit.prob.D.2 <- glm(search_conducted ~ 
+                    subject_age*reason_for_stop + 
+                    subject_race*reason_for_stop + 
+                    subject_sex*reason_for_stop,
+                  family = 'binomial', data = datBos)
+  cv.error.2[i] <- cv.glm(datBos, fit.prob.D.2, K = 10)$delta[1]
+}
+c(mean(cv.error.1), mean(cv.error.2)) # performace are close, model 1 is simpler
+
+# model 1 function
+iptw.1 <- function(dat){
+  fit.prob.D.1 <- glm(search_conducted ~ 
+                    subject_age + 
+                    subject_race + 
+                    subject_sex + 
+                    reason_for_stop,
+                  family = 'binomial', data = dat)
+  prob.D1 <- predict(fit.prob.D.1, type = 'response')
+  # calculate weights
+  wt1 <- as.numeric(datBos$search_conducted == 1)/prob.D1
+  # estimate
+  est.IPTW.1 <- mean(wt1*dat$contraband_found, na.rm = TRUE)
+  # Stabelized IPTW
+  wt1.mean <- mean(wt1[!is.na(datBos$contraband_found)])
+  est.sIPTW.1 <- mean(wt1*datBos$contraband_found, na.rm = TRUE)/wt1.mean
+  list(est.IPTW.1, est.sIPTW.1, wt1)
+}
+
+est.IPTW <- iptw.1(datBos)
+# IPTW point estimate
+est.IPTW[[1]]
+# standardized IPTW point estimate
+est.IPTW[[2]]
+# distribution of weight
+summary(est.IPTW[[3]]) # large variation
+
+# We adopt standardized IPTW estimator
+# Nonparametric bootstrap 500 times
+est.IPTW1 <- 0
+for (k in 1:500){
+  dat.bp <- datBos[sample(1:n, n, replace = TRUE), ]
+  est.IPTW1[k] <- iptw.1(dat.bp)[[2]]
+}
+# mean
+mean(est.IPTW1)
+# standard error
+sd(est.IPTW1)
+# confidence interval 5%
+c(est.IPTW[[2]] - 1.96*sd(est.IPTW1), est.IPTW[[2]] + 1.96*sd(est.IPTW1))
+```
+
+# TMLE
+
+\begin{equation*}
+\Psi_{T M L E}(\hat{\mathbb{P}})=\frac{1}{n} \sum_{i=1}^{n}\left[\hat{\mathbb{E}}^{*}\left(Y | A_{i}=1, W_{i}\right)-\hat{\mathbb{E}}^{*}\left(Y | A_{i}=0, W_{i}\right)\right]
+\end{equation*}
+
+Here we use super learner.
+
+```{r, cache = TRUE}
+# TMLE
+set.seed(2019)
+# specify the library
+SL.library<- c("SL.mean", "SL.glm", "SL.glm.interaction")
+
+# G-spomputation with Super Learner
+# Estimate E_0(Y|A,W) 
+X <- subset(datBos.searched, select = c(subject_age, subject_race, 
+                                        subject_sex, reason_for_stop))
+X1 <- subset(datBos.intervene, select = c(subject_age, subject_race, 
+                                        subject_sex, reason_for_stop))
+fit.SL.1 <- SuperLearner(Y=as.numeric(datBos.searched$contraband_found), 
+                       X=X, SL.library=SL.library, family='binomial')
+# performace of superlearner
+CV.fit.SL.1 <- CV.SuperLearner(Y=as.numeric(datBos.searched$contraband_found), 
+                       X=X, SL.library=SL.library, family='binomial')
+summary(CV.fit.SL.1) # superlearner is not the best!!!!!!!!!!
+
+EY.1W <- predict(fit.SL.1, newdata = X1)$pred
+est.gcomp.SL <- mean(EY.1W)
+est.gcomp.SL
+
+# IPTW with Super Learner
+X <- subset(datBos, select = c(subject_age, subject_race, 
+                               subject_sex, reason_for_stop))
+fit.SL.2 <- SuperLearner(Y=as.numeric(datBos$search_conducted), 
+                       X=X, SL.library=SL.library, family='binomial')
+# performace of superlearner
+CV.fit.SL.2 <- CV.SuperLearner(Y=as.numeric(datBos$search_conducted), 
+                       X=X, SL.library=SL.library, family='binomial')
+summary(CV.fit.SL.2) # superlearner is not the best!!!!!!!!!!
+
+PA1.W <- fit.SL.2$SL.predict
+H.AW <- as.numeric(datBos$search_conducted == 1)/PA1.W
+H.AW.mean.s <- mean(H.AW[!is.na(datBos$contraband_found)])
+# standardized IPTW
+est.sIPTW.SL <- mean(H.AW*datBos$contraband_found, na.rm = TRUE)/H.AW.mean.s
+est.sIPTW.SL
+
+# TMLE estimate
+# one-step update intial estimator of EY.AW
+H.AW.std.s <- H.AW[!is.na(datBos$contraband_found)]/H.AW.mean.s
+EY.1W.s <- EY.1W[!is.na(datBos$contraband_found)]
+logitUpdate <- glm(datBos.searched$contraband_found ~ -1 + offset(qlogis(EY.1W.s)) + H.AW.std.s, 
+                    family='binomial')
+epsilon <- logitUpdate$coefficients
+H.1W <- 1/PA1.W
+H.1W.std <- H.1W/mean(H.1W)
+EY.1W.star <- plogis(qlogis(EY.1W) + epsilon*H.1W.std)
+est.TLME <- mean(EY.1W.star)
+est.TLME
+
+# use ltmle package 
+#####################################################
+# if we use dataset which only includes searched cases, 
+# then all search_conducted is 1, model cannot fit
+# if we use dataset with all cases, 
+# then contraband_found has missing value, model cannot fit wither.
+# Conclusion: we must update by hard coding.
+########################################################
+
+# datBos.searched.new <- datBos.searched %>% 
+#   mutate(search_conducted = as.numeric(search_conducted),
+#          contraband_found = as.numeric(contraband_found))
+# ltmle.SL<- ltmle(data=datBos.searched.new, Anodes='search_conducted', 
+#                  Ynodes='contraband_found', abar=1, SL.library=SL.library)
+```
+
+```{r, cache = TRUE}
+# nonparametric bootstrap for variance estimation
+
+# hard code function
+est.all <- function(dat.bp){
+  # Simple substitution
+  dat.s<-  dat.bp %>% filter(search_conducted == TRUE)
+  dat.i <- dat.bp %>% mutate(search_conducted = TRUE)
+  
+  X <- subset(dat.s, select = c(subject_age, subject_race, 
+                                        subject_sex, reason_for_stop))
+  X1 <- subset(dat.i, select = c(subject_age, subject_race, 
+                                          subject_sex, reason_for_stop))
+  fit.SL.1 <- SuperLearner(Y=as.numeric(dat.s$contraband_found), 
+                         X=X, SL.library=SL.library, family='binomial')
+  EY.1W <- predict(fit.SL.1, newdata = X1)$pred
+  est.gcomp.SL <- mean(EY.1W)
+  
+  # IPTW
+  X <- subset(dat.bp, select = c(subject_age, subject_race, 
+                                 subject_sex, reason_for_stop))
+  fit.SL.2 <- SuperLearner(Y=as.numeric(dat.bp$search_conducted), 
+                         X=X, SL.library=SL.library, family='binomial')
+  
+  PA1.W <- fit.SL.2$SL.predict
+  H.AW <- as.numeric(dat.bp$search_conducted == 1)/PA1.W
+  H.AW.mean.s <- mean(H.AW[!is.na(dat.bp$contraband_found)])
+  # standardized IPTW
+  est.sIPTW.SL <- mean(H.AW*dat.bp$contraband_found, na.rm = TRUE)/H.AW.mean.s
+  
+  # TMLE
+  H.AW.std.s <- H.AW[!is.na(dat.bp$contraband_found)]/H.AW.mean.s
+  EY.1W.s <- EY.1W[!is.na(dat.bp$contraband_found)]
+  logitUpdate <- glm(dat.s$contraband_found ~ -1 + offset(qlogis(EY.1W.s)) + H.AW.std.s, 
+                      family='binomial')
+  epsilon <- logitUpdate$coefficients
+  H.1W <- 1/PA1.W
+  H.1W.std <- H.1W/mean(H.1W)
+  EY.1W.star <- plogis(qlogis(EY.1W) + epsilon*H.1W.std)
+  est.TLME <- mean(EY.1W.star)
+  c(est.gcomp.SL, est.sIPTW.SL, est.TLME)
+}
+
+# bootstrap
+set.seed(2019)
+est.results <- matrix(NA, ncol = 3, nrow = 500)
+for (k in 1:500){
+  dat.bp <- datBos[sample(1:n, n, replace = TRUE), ]
+  est.results[k,] <- est.all(dat.bp)
+}
+
+# plot histgrams
+par(mfrow = c(1,3))
+for(i in 1:3){
+  print(hist(est.results[,i]))
+}
+
+# point estimate
+est.pt <- est.all(datBos)
+
+# confidence interval
+est.sd <- apply(est.results, 2, sd)
+cbind(est.pt - 1.96*est.sd, est.pt + 1.96*est.sd)
+```
+
+```{r}
+# save all results
+save.image(file = "envir_1207_v1.Rdata")
+```
