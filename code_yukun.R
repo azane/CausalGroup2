@@ -36,7 +36,7 @@ summary(datBos$subject_sex)
 table(datBos$vehicle_type)
 sum(is.na(datBos$vehicle_type))
 
-# D : search_conductred
+# D : search_conducted
 # Y* : Underlying contraband status
 # Y : contraband_found
 # W1 : age
